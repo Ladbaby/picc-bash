@@ -1,5 +1,7 @@
 # picc-bash
 
+[![npm downloads](https://img.shields.io/npm/dt/@ladbabynpm/picc-bash.svg)](https://www.npmjs.com/package/@ladbabynpm/picc-bash)
+
 Claude Code style Bash and TaskStops tool for pi. 
 Part of [picc](https://github.com/Ladbaby/picc), a pi agent setup mirroring Claude Code's harness.
 Adds background-task support and Claude-Code-style timeouts to pi's bash execution.
