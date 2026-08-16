@@ -1,12 +1,9 @@
 # picc-bash
 
-Claude Code-compatible Bash tool for pi. Adds background-task support and
-Claude-Code-style timeouts to pi's bash execution. Behavior, schema descriptions,
-output format, kill semantics, abort handling, task ID generation, prompt
-guidelines, and storage layout all mirror Claude Code's Bash tool
-(`tools/BashTool/BashTool.tsx`) and TaskStop tool
-(`tools/TaskStopTool/TaskStopTool.ts`) — see the in-line source citations for
-which Claude Code function each section was ported from.
+Claude Code style Bash and TaskStops tool for pi. 
+Part of [picc](https://github.com/Ladbaby/picc), a pi agent setup mirroring Claude Code's harness.
+Adds background-task support and Claude-Code-style timeouts to pi's bash execution.
+Behavior, schema descriptions, output format, kill semantics, abort handling, task ID generation, prompt guidelines, and storage layout all mirror Claude Code's Bash tool (`tools/BashTool/BashTool.tsx`) and TaskStop tool (`tools/TaskStopTool/TaskStopTool.ts`) — see the in-line source citations for which Claude Code function each section was ported from.
 
 ## Tools registered
 
