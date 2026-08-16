@@ -19,8 +19,6 @@ that path.
 
 ## Usage
 
-## Usage
-
 Install via `pi install npm:@ladbabynpm/picc-bash`.
 
 ## Tool name configuration
