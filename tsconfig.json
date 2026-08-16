@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "Bundler",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"noEmit": true,
+		"allowImportingTsExtensions": false,
+		"typeRoots": [
+			"./node_modules/@earendil-works/pi-coding-agent/node_modules/@types",
+			"./node_modules/@types"
+		]
+	},
+	"include": ["index.ts"]
+}
