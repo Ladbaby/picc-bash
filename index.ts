@@ -69,7 +69,14 @@ type ToolName = (typeof VALID_TOOL_NAMES)[number];
 function resolveConfigPath(): string {
 	const env = process.env.PICC_BASH_CONFIG_PATH;
 	if (env) return env;
-	return join(homedir(), ".pi", "agent", "extensions", "picc-bash", "config.json");
+	return join(
+		homedir(),
+		".pi",
+		"agent",
+		"extensions",
+		"picc-bash",
+		"config.json",
+	);
 }
 
 function readToolNameFromConfig(): ToolName | undefined {

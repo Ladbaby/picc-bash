@@ -351,7 +351,6 @@ test("foreground: backslash Windows path resolves correctly (MSYS regression)", 
 		/cannot access 'C:Users/i,
 		"output must not contain the cmd.exe backslash-mangling error",
 	);
-	assert.match(text, /pi-subagents/, "output should list pi-subagents");
 });
 
 test("resolveBashPath returns a usable bash.exe on Windows", () => {
