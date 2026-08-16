@@ -17,6 +17,12 @@ Claude Code marks `TaskOutput` deprecated and instructs models to use `Read` on 
 output file path instead. The Bash tool's `run_in_background` result already returns
 that path.
 
+## Usage
+
+## Usage
+
+Install via `pi install npm:@ladbabynpm/picc-bash`.
+
 ## Tool name configuration
 
 The Bash tool is registered as `"bash"` (lowercase) by default for compatibility with pi's existing extension ecosystem. To register it as `"Bash"` (capital-B,
