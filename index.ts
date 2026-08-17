@@ -1044,7 +1044,7 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 					run_in_background: Type.Optional(
 						Type.Boolean({
 							description:
-								"Set to true to run this command in the background. Use Read to read the output later.",
+								"Set to true to run this command in the background. Use read to read the output later.",
 						}),
 					),
 				}),
@@ -1181,7 +1181,7 @@ Important:
 	// Single-line guideline replacing the old multi-line getBashPromptGuidelines()
 	// (the long-form instructions now live in BASH_PROMPT_SNIPPET above).
 	const BASH_PROMPT_GUIDELINE =
-		"Prefer dedicated tools over bash when one fits (Read, Edit, Write, Glob, Grep) — reserve bash for shell-only operations.";
+		"Prefer dedicated tools over bash when one fits (read, edit, write, Glob, Grep) — reserve bash for shell-only operations.";
 
 	pi.registerTool({
 		name: config.toolName,
