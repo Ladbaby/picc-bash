@@ -1,6 +1,6 @@
 {
 	"name": "@ladbabynpm/picc-bash",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Claude Code-compatible Bash tool for pi: run_in_background, configurable tool name, TaskStop.",
 	"type": "module",
 	"main": "index.ts",
