@@ -59,11 +59,13 @@ test("label follows the configured tool name", () => {
 
 test("TaskStop description matches Claude Code", () => {
 	const stop = registered.find((t) => t.name === "TaskStop");
-	// Claude Code: tools/TaskStopTool/TaskStopTool.ts:99-101 — async
-	// description() returns `Stop a running background task by ID`.
+	// pi's `description` field carries the bullet-list prompt (mirroring Claude
+	// Code's tools/TaskStopTool/prompt.ts:3-9), not the short `description()`
+	// string from TaskStopTool.ts:92-93 — those are different request-structure
+	// fields. So assert on the bullet-list content.
 	assert.match(
 		stop?.description ?? "",
-		/Stop a running background task by ID/i,
+		/- Stops a running background task by its ID/,
 	);
 });
 
