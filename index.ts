@@ -9,6 +9,11 @@
  * `${tmpdir()}/picc-bash/{sessionId}/tasks/{taskId}.output` (mirroring Claude
  * Code's `getTaskOutputPath`), plus a `TaskStop` tool.
  *
+ * Like Claude Code, a foreground command that reaches its timeout is
+ * auto-backgrounded (moved to a background task that keeps running) rather
+ * than killed — except for plain `sleep` and when background tasks are
+ * disabled via `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`.
+ *
  * The deprecated `TaskOutput` tool is intentionally NOT registered — Claude
  * Code tells models to use the `Read` tool on the output file path instead.
  * The Bash tool's `run_in_background` result already returns that path.
@@ -128,6 +133,12 @@ export const config = { toolName: loadToolName() };
 const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
 const MAX_TIMEOUT_MS = 600_000; // 10 minutes
 const MAX_TASK_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// Commands that should NOT be auto-backgrounded on timeout.
+// Mirrors claude-code/tools/BashTool/BashTool.tsx:220 — `sleep` should run in
+// the foreground (it is usually deliberate pacing, not real work), so a
+// timed-out `sleep` is still killed rather than moved to the background.
+const DISALLOWED_AUTO_BACKGROUND_COMMANDS: readonly string[] = ["sleep"];
 
 /** Top-level subdir under tmpdir for picc-bash output. */
 const TASKS_ROOT_NAME = "picc-bash";
@@ -450,6 +461,20 @@ function resolveTimeoutMs(requested: number | undefined): number {
 	return Math.min(Math.max(requestedMs, 1), max);
 }
 
+/**
+ * Determine whether a timed-out foreground command may be auto-backgrounded.
+ *
+ * Mirrors claude-code/tools/BashTool/BashTool.tsx:307-313 (`isAutobackgroundingAllowed`):
+ * a command is auto-backgroundable unless its base command (first whitespace-
+ * delimited token) is in DISALLOWED_AUTO_BACKGROUND_COMMANDS (e.g. `sleep`).
+ * An empty command is treated as backgroundable (nothing to match).
+ */
+function isAutobackgroundingAllowed(command: string): boolean {
+	const baseCommand = command.split(/\s+/)[0]?.trim();
+	if (!baseCommand) return true;
+	return !DISALLOWED_AUTO_BACKGROUND_COMMANDS.includes(baseCommand);
+}
+
 // ============================================================================
 // Git Bash detection (Windows)
 //
@@ -635,6 +660,21 @@ interface ForegroundResult {
 	timedOut: boolean;
 	aborted: boolean;
 	interrupted: boolean;
+	/**
+	 * Set when the command hit its timeout and was auto-backgrounded (the live
+	 * child was handed to a background task instead of being killed).
+	 */
+	backgrounded?: boolean;
+}
+
+/**
+ * Optional hook passed to `executeForeground` that fires when the foreground
+ * timeout elapses. When provided, the child is NOT killed; instead the hook
+ * takes ownership of the live process (e.g. re-attaches its streams to a
+ * background task) and the promise resolves with `backgrounded: true`.
+ */
+interface ForegroundOptions {
+	onTimeout?: (child: ChildProcess, stdout: string, stderr: string) => void;
 }
 
 // Claude Code treats stderr as part of stdout (merged fd for bash). For pi
@@ -645,6 +685,7 @@ async function executeForeground(
 	cwd: string,
 	timeoutMs: number,
 	signal: AbortSignal | undefined,
+	options: ForegroundOptions = {},
 ): Promise<ForegroundResult> {
 	return new Promise((resolve) => {
 		const { shell, args } = resolveShell(command);
@@ -661,6 +702,7 @@ async function executeForeground(
 		let timedOut = false;
 		let aborted = false;
 		let interrupted = false;
+		let settled = false;
 		let timeoutHandle: NodeJS.Timeout | undefined;
 
 		const onAbort = () => {
@@ -681,26 +723,15 @@ async function executeForeground(
 			if (signal) signal.removeEventListener("abort", onAbort);
 		};
 
-		child.stdout?.on("data", (chunk: Buffer) => {
+		const foregroundStdoutHandler = (chunk: Buffer) => {
 			stdout += chunk.toString("utf-8");
-		});
-		child.stderr?.on("data", (chunk: Buffer) => {
+		};
+		const foregroundStderrHandler = (chunk: Buffer) => {
 			stderr += chunk.toString("utf-8");
-		});
-
-		child.on("error", () => {
-			cleanup();
-			resolve({
-				stdout,
-				stderr,
-				exitCode: null,
-				timedOut,
-				aborted,
-				interrupted,
-			});
-		});
-
-		child.on("exit", (code) => {
+		};
+		const foregroundExitHandler = (code: number) => {
+			if (settled) return;
+			settled = true;
 			cleanup();
 			if (signal?.aborted && !aborted && !interrupted) {
 				aborted = true;
@@ -713,7 +744,26 @@ async function executeForeground(
 				aborted,
 				interrupted,
 			});
+		};
+
+		child.stdout?.on("data", foregroundStdoutHandler);
+		child.stderr?.on("data", foregroundStderrHandler);
+
+		child.on("error", () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve({
+				stdout,
+				stderr,
+				exitCode: null,
+				timedOut,
+				aborted,
+				interrupted,
+			});
 		});
+
+		child.on("exit", foregroundExitHandler);
 
 		if (signal) {
 			if (signal.aborted) {
@@ -725,8 +775,30 @@ async function executeForeground(
 
 		if (timeoutMs > 0) {
 			timeoutHandle = setTimeout(() => {
-				timedOut = true;
-				if (child.pid !== undefined) killProcess(child.pid, "SIGTERM");
+				if (settled) return;
+				const onTimeout = options.onTimeout;
+				if (onTimeout) {
+					// Don't kill. Hand the live child to the caller so it can be
+					// promoted to a background task (mirrors claude-code
+					// ShellCommand.#handleTimeout → #onTimeoutCallback(background)).
+					settled = true;
+					if (timeoutHandle) clearTimeout(timeoutHandle);
+					child.stdout?.removeListener("data", foregroundStdoutHandler);
+					child.stderr?.removeListener("data", foregroundStderrHandler);
+					onTimeout(child, stdout, stderr);
+					resolve({
+						stdout,
+						stderr,
+						exitCode: null,
+						timedOut: true,
+						aborted: false,
+						interrupted: false,
+						backgrounded: true,
+					});
+				} else {
+					timedOut = true;
+					if (child.pid !== undefined) killProcess(child.pid, "SIGTERM");
+				}
 			}, timeoutMs);
 		}
 	});
@@ -903,6 +975,94 @@ class DiskTaskOutput {
 // 'l' = local_bash (matches Claude Code's TASK_ID_PREFIXES.local_bash).
 function newTaskId(): string {
 	return generateTaskId("l");
+}
+
+interface BackgroundExistingForegroundTaskArgs {
+	child: ChildProcess;
+	/** Output already captured in memory before the timeout fired. */
+	stdout: string;
+	stderr: string;
+	id: string;
+	command: string;
+	description: string | undefined;
+	ctx: ExtensionContext;
+}
+
+/**
+ * Promote an already-running foreground child to a background task instead of
+ * killing it on timeout.
+ *
+ * Mirrors claude-code's `ShellCommand.background(taskId)` (`utils/ShellCommand.ts:349-366`)
+ * plus the foreground→background hand-off in
+ * `BashTool.tsx` (`backgroundExistingForegroundTask`). Unlike `startBackgroundTask` —
+ * which spawns a brand-new process — this reuses the live foreground child so no
+ * work or already-emitted output is lost:
+ *   - seeds the task output file and pre-loads the already-captured stdout/stderr
+ *   - re-points the child's streams at the task's `DiskTaskOutput`
+ *   - registers the `BackgroundTask` and re-wires exit/error handlers so the
+ *     usual completion notification fires when the process finishes
+ *
+ * The caller has already detached the foreground stream listeners (see
+ * `executeForeground`'s timeout path); this function attaches the task ones.
+ */
+function backgroundExistingForegroundTask(
+	args: BackgroundExistingForegroundTaskArgs,
+): BackgroundTask {
+	const { child, stdout, stderr, id, command, description, ctx } = args;
+	const outputPath = getTaskOutputPath(id, ctx);
+	ensureTasksDir(ctx);
+	writeFileSync(outputPath, "", "utf-8");
+
+	const task: BackgroundTask = {
+		id,
+		command,
+		description,
+		status: "running",
+		exitCode: null,
+		outputPath,
+		startedAt: Date.now(),
+		pid: child.pid ?? undefined,
+		interrupted: false,
+	};
+	upsertTask(task);
+
+	const disk = new DiskTaskOutput(id);
+	// Pre-load output captured during the foreground phase so the task file is
+	// complete from the moment the model Reads it.
+	if (stdout) disk.append(stdout);
+	if (stderr) disk.append(stderr);
+
+	child.stdout?.on("data", (chunk: Buffer) => {
+		disk.append(chunk.toString("utf-8"));
+	});
+	child.stderr?.on("data", (chunk: Buffer) => {
+		disk.append(chunk.toString("utf-8"));
+	});
+
+	child.on("exit", (code) => {
+		const status: TaskStatus = code === 0 ? "completed" : "failed";
+		const updated: BackgroundTask = {
+			...task,
+			status,
+			exitCode: code,
+			completedAt: Date.now(),
+		};
+		upsertTask(updated);
+		notifyTaskComplete(updated);
+	});
+
+	child.on("error", () => {
+		const updated: BackgroundTask = {
+			...task,
+			status: "failed",
+			completedAt: Date.now(),
+			interrupted: true,
+		};
+		upsertTask(updated);
+		notifyTaskComplete(updated);
+	});
+
+	return task;
 }
 
 async function startBackgroundTask(
@@ -1176,7 +1336,8 @@ Important:
 
 # Other common operations
 - View comments on a Github PR: gh api repos/foo/bar/pulls/123/comments`;
-	const BASH_PROMPT_SNIPPET = "Executes a given bash command and returns its output.";
+	const BASH_PROMPT_SNIPPET =
+		"Executes a given bash command and returns its output.";
 
 	// Single-line guideline replacing the old multi-line getBashPromptGuidelines()
 	// (the long-form instructions now live in BASH_PROMPT_SNIPPET above).
@@ -1259,12 +1420,47 @@ Important:
 				return result;
 			}
 
+			// Auto-background on timeout (mirrors claude-code
+			// BashTool.tsx:880 `shouldAutoBackground`): enabled unless background
+			// tasks are disabled, and only for commands allowed to background
+			// (i.e. not `sleep`).
+			const shouldAutoBackground =
+				!isBackgroundDisabled && isAutobackgroundingAllowed(command);
+
+			let backgroundedTask: BackgroundTask | undefined;
 			const result = await executeForeground(
 				command,
 				ctx.cwd,
 				effectiveTimeout,
 				signal,
+				{
+					onTimeout: shouldAutoBackground
+						? (child, capturedStdout, capturedStderr) => {
+								backgroundedTask = backgroundExistingForegroundTask({
+									child,
+									stdout: capturedStdout,
+									stderr: capturedStderr,
+									id: newTaskId(),
+									command,
+									description,
+									ctx,
+								});
+							}
+						: undefined,
+				},
 			);
+
+			// If the timed-out command was promoted to a background task, return
+			// the same shape as an explicit `run_in_background` result (no error):
+			// the model reads the output file and is notified on completion.
+			if (result.backgrounded && backgroundedTask) {
+				const text = `Command running in background with ID: ${backgroundedTask.id}. Output is being written to: ${backgroundedTask.outputPath}`;
+				const bgResult: BashToolResult = {
+					content: [tc(text)],
+					details: { backgroundTaskId: backgroundedTask.id },
+				};
+				return bgResult;
+			}
 
 			// Build tool-result text per Claude Code's mapToolResultToToolResultBlockParam
 			// (BashTool.tsx:484-507): [processedStdout, errorMessage, backgroundInfo].join('\n').

@@ -109,17 +109,71 @@ test("foreground: exit 1 returns isError=true", async () => {
 	assert.match(r.content[0].text, /Exit code 1/);
 });
 
-test("foreground: timeout kills long-running command", async () => {
+test("foreground: sleep is not auto-backgrounded (killed on timeout)", async () => {
+	// `sleep` is in DISALLOWED_AUTO_BACKGROUND_COMMANDS (claude-code parity), so
+	// a timed-out `sleep` is still killed rather than backgrounded.
+	// Windows is skipped: cmd.exe has no `sleep` (the test would exit early).
+	if (process.platform === "win32") return;
 	const r = await bash.execute!(
 		"call-3",
-		{ command: isWindows ? "ping -n 30 127.0.0.1" : "sleep 5", timeout: 500 },
+		{ command: "sleep 5", timeout: 500 },
 		undefined,
 		undefined,
 		ctx,
 	);
 	assert.equal(r.isError, true, "should be an error after timeout");
-	const details = r.details as { timedOut?: boolean };
+	const details = r.details as { timedOut?: boolean; backgroundTaskId?: string };
 	assert.equal(details?.timedOut, true, "details.timedOut should be true");
+	assert.equal(details?.backgroundTaskId, undefined, "sleep must not be backgrounded");
+});
+
+test("foreground: command that hits its timeout is auto-backgrounded", async () => {
+	// A backgroundable command (base command != sleep) that keeps running past
+	// its timeout is promoted to a background task instead of being killed
+	// (mirrors claude-code BashTool auto-backgrounding on timeout).
+	const command = isWindows ? "ping -n 30 127.0.0.1" : "echo auto-bg-marker; sleep 30";
+	const r = await bash.execute!(
+		"call-17",
+		{ command, timeout: 500 },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const details = r.details as { backgroundTaskId?: string };
+	assert.ok(details?.backgroundTaskId, "should return a background task id");
+	assert.equal(r.isError, undefined, "auto-backgrounding is not an error");
+	assert.match(
+		r.content[0].text,
+		/Command running in background with ID: /,
+		"result text should announce the background task",
+	);
+	assert.match(
+		r.content[0].text,
+		/Output is being written to: .+\.output/,
+		"result text should include the output file path",
+	);
+
+	// The promoted task must actually keep running and keep writing output —
+	// verify the pre-timeout output landed in the task file.
+	const outputFile = join(expectedOutputDir(), `${details.backgroundTaskId}.output`);
+	await new Promise((r) => setTimeout(r, 1000));
+	assert.ok(existsSync(outputFile), `task output file exists at ${outputFile}`);
+	if (!isWindows) {
+		const raw = readFileSync(outputFile, "utf-8");
+		assert.ok(
+			raw.includes("auto-bg-marker"),
+			"task output file should contain the pre-timeout marker",
+		);
+	}
+
+	// Clean up the still-running backgrounded command.
+	await taskStop.execute!(
+		"call-17-stop",
+		{ task_id: details.backgroundTaskId },
+		undefined,
+		undefined,
+		ctx,
+	);
 });
 
 test("background: long-running task returns task_id and exposes output path", async () => {
