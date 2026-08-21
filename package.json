@@ -1,46 +1,56 @@
 {
-	"name": "@ladbabynpm/picc-bash",
-	"version": "0.2.1",
-	"description": "Claude Code-compatible Bash tool for pi: run_in_background, configurable tool name, TaskStop.",
-	"type": "module",
-	"main": "index.ts",
-	"keywords": [
-		"pi",
-		"pi-package",
-		"pi-extension",
-		"bash",
-		"claude-code"
-	],
-	"license": "MIT",
-	"files": [
-		"index.ts",
-		"README.md"
-	],
-	"pi": {
-		"extensions": [
-			"./index.ts"
-		]
-	},
-	"dependencies": {
-		"tree-kill": "^1.2.2"
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-ai": "^0.82.1",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "^0.82.1",
-		"typebox": "^1.1.37"
-	},
-	"scripts": {
-		"lint": "biome check index.ts",
-		"lint:fix": "biome check --write index.ts",
-		"typecheck": "tsc --noEmit",
-		"test": "tsx test/load.test.ts && tsx test/execute.test.ts"
-	},
-	"devDependencies": {
-		"@biomejs/biome": "^2.5.5",
-		"tsx": "^4.23.1"
-	},
-	"publishConfig": {
-		"access": "public"
-	}
+  "name": "@ladbabynpm/picc-bash",
+  "version": "0.2.2",
+  "description": "Claude Code-compatible Bash tool for pi: run_in_background, configurable tool name, TaskStop.",
+  "type": "module",
+  "main": "index.ts",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "bash",
+    "claude-code"
+  ],
+  "license": "MIT",
+  "author": "ladbabynpm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ladbaby/picc-bash.git"
+  },
+  "homepage": "https://github.com/Ladbaby/picc-bash",
+  "bugs": {
+    "url": "https://github.com/Ladbaby/picc-bash/issues"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "tree-kill": "^1.2.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "^0.82.1",
+    "typebox": "^1.1.37"
+  },
+  "scripts": {
+    "lint": "biome check index.ts",
+    "lint:fix": "biome check --write index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/load.test.ts && tsx test/execute.test.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.5",
+    "tsx": "^4.23.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }
