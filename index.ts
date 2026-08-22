@@ -1220,7 +1220,7 @@ The working directory persists between commands, but shell state does not. The s
 IMPORTANT: Avoid using this tool to run \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`sed\`, \`awk\`, or \`echo\` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user:
 
 - File search: Use Glob (NOT find or ls)
-- Content search: Use Grep (NOT grep or rg)
+- Content search: Use grep (NOT grep or rg)
 - Read files: Use read (NOT cat/head/tail)
 - Edit files: Use edit (NOT sed/awk)
 - Write files: Use write (NOT echo >/cat <<EOF)
@@ -1342,7 +1342,7 @@ Important:
 	// Single-line guideline replacing the old multi-line getBashPromptGuidelines()
 	// (the long-form instructions now live in BASH_PROMPT_SNIPPET above).
 	const BASH_PROMPT_GUIDELINE =
-		"Prefer dedicated tools over bash when one fits (read, edit, write, Glob, Grep) — reserve bash for shell-only operations.";
+		"Prefer dedicated tools over bash when one fits (read, edit, write, Glob, grep) — reserve bash for shell-only operations.";
 
 	pi.registerTool({
 		name: config.toolName,
