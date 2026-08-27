@@ -21,6 +21,15 @@
  * Honors `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` to omit `run_in_background`
  * from the schema.
  *
+ * Like Claude Code, oversized foreground output is NOT hard-truncated. When a
+ * result exceeds the persistence threshold (`BASH_MAX_OUTPUT_LENGTH`, default
+ * 30_000 chars, clamped to 50_000 by `DEFAULT_MAX_RESULT_SIZE_CHARS`), the
+ * full output is saved to a per-session `tool-results` file and the
+ * model-facing content becomes a `<persisted-output>` envelope (a ~2KB preview
+ * plus the saved file path) that the model can `Read`. An `EndTruncatingAccumulator`
+ * (2^25-char cap) bounds the in-memory stream so a runaway command cannot
+ * exhaust memory before that check runs.
+ *
  * Tool name configuration:
  *   - Default: `"bash"` (pi ecosystem standard).
  *   - Claude Code parity: set `config.json` `toolName` to `"Bash"` (default
@@ -134,6 +143,33 @@ const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
 const MAX_TIMEOUT_MS = 600_000; // 10 minutes
 const MAX_TASK_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+// ---------------------------------------------------------------------------
+// Large tool-result handling (mirrors Claude Code).
+//
+// Claude Code does not hard-truncate tool results. When a result exceeds its
+// threshold it persists the full output to a per-session file and returns a
+// small `<persisted-output>` envelope (first PREVIEW_SIZE_BYTES of preview +
+// the saved file path) so the model can `Read` the full output. The threshold
+// below mirrors `utils/shell/outputLimits.ts` (BASH_MAX_OUTPUT_LENGTH, default
+// 30_000, capped at 150_000) clamped by `constants/toolLimits.ts`
+// (DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000).
+// ---------------------------------------------------------------------------
+
+/** Default per-invocation bash output persistence threshold (chars). */
+const BASH_MAX_OUTPUT_DEFAULT = 30_000;
+/** Hard upper bound for BASH_MAX_OUTPUT_LENGTH (chars). */
+const BASH_MAX_OUTPUT_UPPER_LIMIT = 150_000;
+/** Global default cap applied to every tool's persistence threshold. */
+const DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000;
+/** Size of the preview sent to the model inside `<persisted-output>`. */
+const PREVIEW_SIZE_BYTES = 2000;
+/** In-memory safety-net cap for the foreground stream accumulator (chars). */
+const MAX_STRING_LENGTH = 2 ** 25;
+
+/** XML tag used to wrap persisted-output messages. */
+const PERSISTED_OUTPUT_TAG = "<persisted-output>";
+const PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>";
+
 // Commands that should NOT be auto-backgrounded on timeout.
 // Mirrors claude-code/tools/BashTool/BashTool.tsx:220 — `sleep` should run in
 // the foreground (it is usually deliberate pacing, not real work), so a
@@ -214,6 +250,115 @@ function formatDuration(
 }
 
 /**
+ * Ported verbatim from claude-code/utils/format.ts. Formats a byte count as a
+ * human-readable size string (e.g. `1536` → `"1.5KB"`). Used by the
+ * `<persisted-output>` envelope to describe the original output size.
+ */
+function formatFileSize(sizeInBytes: number): string {
+	const kb = sizeInBytes / 1024;
+	if (kb < 1) {
+		return `${sizeInBytes} bytes`;
+	}
+	if (kb < 1024) {
+		return `${kb.toFixed(1).replace(/\.0$/, "")}KB`;
+	}
+	const mb = kb / 1024;
+	if (mb < 1024) {
+		return `${mb.toFixed(1).replace(/\.0$/, "")}MB`;
+	}
+	const gb = mb / 1024;
+	return `${gb.toFixed(1).replace(/\.0$/, "")}GB`;
+}
+
+/**
+ * Ported from claude-code/utils/shell/outputLimits.ts `getMaxOutputLength()`.
+ * Reads `BASH_MAX_OUTPUT_LENGTH`, defaulting to BASH_MAX_OUTPUT_DEFAULT and
+ * capping at BASH_MAX_OUTPUT_UPPER_LIMIT (mirrors validateBoundedIntEnvVar:
+ * non-positive / NaN → default, > upper limit → capped).
+ */
+function getMaxOutputLength(): number {
+	const raw = process.env.BASH_MAX_OUTPUT_LENGTH;
+	if (!raw) return BASH_MAX_OUTPUT_DEFAULT;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) {
+		return BASH_MAX_OUTPUT_DEFAULT;
+	}
+	return Math.min(parsed, BASH_MAX_OUTPUT_UPPER_LIMIT);
+}
+
+/**
+ * Ported from claude-code/utils/toolResultStorage.ts `getPersistenceThreshold`.
+ * For the bash tool the declared threshold is BASH_MAX_OUTPUT_DEFAULT
+ * (maxResultSizeChars: 30_000), clamped by the global default
+ * DEFAULT_MAX_RESULT_SIZE_CHARS. Resolved through getMaxOutputLength() so the
+ * env override participates, then clamped.
+ */
+function getPersistenceThreshold(): number {
+	return Math.min(getMaxOutputLength(), DEFAULT_MAX_RESULT_SIZE_CHARS);
+}
+
+/**
+ * Ported verbatim from claude-code/utils/stringUtils.ts. A string accumulator
+ * that safely handles large outputs by truncating from the END when a size
+ * limit is exceeded. This is the in-memory safety net for the foreground
+ * stdout/stderr streams: it prevents a runaway command from exhausting memory
+ * (and a RangeError) before the larger-output persistence check runs. Overflow
+ * is marked and reported with a `\n... [output truncated - NKB removed]` note.
+ */
+class EndTruncatingAccumulator {
+	#content: string = "";
+	#isTruncated = false;
+	#totalBytesReceived = 0;
+	#maxSize: number;
+
+	/** @param maxSize Maximum size in characters before truncation occurs. */
+	constructor(maxSize: number = MAX_STRING_LENGTH) {
+		this.#maxSize = maxSize;
+	}
+
+	/**
+	 * Appends data to the accumulator. If the total size exceeds maxSize, the
+	 * end is truncated to maintain the size limit.
+	 */
+	append(data: string | Buffer): void {
+		const str = typeof data === "string" ? data : data.toString();
+		this.#totalBytesReceived += str.length;
+
+		// If already at capacity and truncated, don't modify content.
+		if (this.#isTruncated && this.#content.length >= this.#maxSize) {
+			return;
+		}
+
+		// Check if adding the string would exceed the limit.
+		if (this.#content.length + str.length > this.#maxSize) {
+			// Only append what we can fit.
+			const remainingSpace = this.#maxSize - this.#content.length;
+			if (remainingSpace > 0) {
+				this.#content += str.slice(0, remainingSpace);
+			}
+			this.#isTruncated = true;
+		} else {
+			this.#content += str;
+		}
+	}
+
+	/** Returns the accumulated string, with a truncation marker if truncated. */
+	toString(): string {
+		if (!this.#isTruncated) {
+			return this.#content;
+		}
+		const truncatedBytes = this.#totalBytesReceived - this.#maxSize;
+		const truncatedKB = Math.round(truncatedBytes / 1024);
+		return `${this.#content}\n... [output truncated - ${truncatedKB}KB removed]`;
+	}
+
+	/** Returns whether truncation has occurred. */
+	get truncated(): boolean {
+		return this.#isTruncated;
+	}
+}
+
+/**
  * Ported from claude-code/Task.ts:96-104. Generates a task ID with a single-
  * letter prefix identifying the task type, followed by 8 base36 characters.
  * `local_bash` → `l` prefix (matches Claude Code's TASK_ID_PREFIXES).
@@ -260,6 +405,13 @@ interface BashToolDetails {
 	aborted?: boolean;
 	interrupted?: boolean;
 	exitCode?: number | null;
+	/**
+	 * Set when the foreground output exceeded the persistence threshold and was
+	 * saved to a tool-results file (mirrors Claude Code's `persistedOutputPath`).
+	 */
+	persistedOutputPath?: string;
+	/** Total size of the persisted output in bytes (mirrors `persistedOutputSize`). */
+	persistedOutputSize?: number;
 }
 
 /** Claude Code TaskStop output schema (tools/TaskStopTool/TaskStopTool.ts:14-29). */
@@ -339,6 +491,122 @@ function getTaskOutputPath(taskId: string, ctx?: ExtensionContext): string {
 export function _resetStoragePathsForTest(): void {
 	_sessionId = undefined;
 	_tasksDir = undefined;
+}
+
+// ============================================================================
+// Tool-results storage — mirror Claude Code's `tool-results` dir
+// (utils/toolResultStorage.ts: getToolResultsDir / getToolResultPath /
+// ensureToolResultsDir).
+//
+// Pattern: ${tmpdir()}/picc-bash/{sessionId}/tool-results/{toolCallId}.txt
+//
+// When a foreground result exceeds the persistence threshold, the full output
+// is written here and the model-facing content becomes a `<persisted-output>`
+// envelope pointing at this file.
+// ============================================================================
+
+function getToolResultsDir(ctx?: ExtensionContext): string {
+	return join(tmpdir(), TASKS_ROOT_NAME, getSessionId(ctx), "tool-results");
+}
+
+function ensureToolResultsDir(ctx?: ExtensionContext): string {
+	const dir = getToolResultsDir(ctx);
+	if (!existsSync(dir)) {
+		mkdirSync(dir, { recursive: true });
+	}
+	return dir;
+}
+
+/**
+ * Ported from claude-code/utils/toolResultStorage.ts `generatePreview`.
+ * Truncates content to maxBytes, preferring a newline boundary when one falls
+ * in the last 50% of the window (so the preview doesn't end mid-line).
+ */
+function generatePreview(
+	content: string,
+	maxBytes: number,
+): { preview: string; hasMore: boolean } {
+	if (content.length <= maxBytes) {
+		return { preview: content, hasMore: false };
+	}
+	const truncated = content.slice(0, maxBytes);
+	const lastNewline = truncated.lastIndexOf("\n");
+	const cutPoint = lastNewline > maxBytes * 0.5 ? lastNewline : maxBytes;
+	return { preview: content.slice(0, cutPoint), hasMore: true };
+}
+
+/**
+ * Ported from claude-code/utils/toolResultStorage.ts `buildLargeToolResultMessage`.
+ * Wraps a persisted-output reference the way Claude Code does.
+ */
+function buildLargeToolResultMessage(args: {
+	filepath: string;
+	originalSize: number;
+	preview: string;
+	hasMore: boolean;
+}): string {
+	let message = `${PERSISTED_OUTPUT_TAG}\n`;
+	message += `Output too large (${formatFileSize(args.originalSize)}). Full output saved to: ${args.filepath}\n\n`;
+	message += `Preview (first ${formatFileSize(PREVIEW_SIZE_BYTES)}):\n`;
+	message += args.preview;
+	message += args.hasMore ? "\n...\n" : "\n";
+	message += PERSISTED_OUTPUT_CLOSING_TAG;
+	return message;
+}
+
+/**
+ * Persist a large tool result to the session's tool-results dir and return the
+ * file path + original size. Mirrors Claude Code's `persistToolResult` (minus
+ * the analytics / JSON framing — bash output is always plain text here).
+ */
+function persistOutput(
+	text: string,
+	toolCallId: string,
+	ctx?: ExtensionContext,
+): { filepath: string; originalSize: number } {
+	const dir = ensureToolResultsDir(ctx);
+	const filepath = join(dir, `${toolCallId}.txt`);
+	try {
+		writeFileSync(filepath, text, "utf-8");
+	} catch {
+		// On failure the caller still returns the preview; the full file is a
+		// best-effort artifact.
+	}
+	return { filepath, originalSize: text.length };
+}
+
+/**
+ * Mirrors Claude Code's per-tool persistence gate (`maybePersistLargeToolResult`):
+ * when a formatted bash result exceeds the persistence threshold, write the full
+ * output to the session tool-results dir and build the `<persisted-output>`
+ * envelope. Returns null when the result is small enough to pass through
+ * inline.
+ */
+function persistLargeOutputIfExceeds(
+	outputText: string,
+	toolCallId: string,
+	ctx?: ExtensionContext,
+): {
+	contentText: string;
+	persistedOutputPath: string;
+	persistedOutputSize: number;
+} | null {
+	if (!outputText || outputText.length <= getPersistenceThreshold()) {
+		return null;
+	}
+	const { filepath, originalSize } = persistOutput(outputText, toolCallId, ctx);
+	const { preview, hasMore } = generatePreview(outputText, PREVIEW_SIZE_BYTES);
+	const contentText = buildLargeToolResultMessage({
+		filepath,
+		originalSize,
+		preview,
+		hasMore,
+	});
+	return {
+		contentText,
+		persistedOutputPath: filepath,
+		persistedOutputSize: originalSize,
+	};
 }
 
 // ============================================================================
@@ -697,13 +965,18 @@ async function executeForeground(
 			windowsHide: true,
 		});
 
-		let stdout = "";
-		let stderr = "";
+		const stdoutAcc = new EndTruncatingAccumulator();
+		const stderrAcc = new EndTruncatingAccumulator();
 		let timedOut = false;
 		let aborted = false;
 		let interrupted = false;
 		let settled = false;
 		let timeoutHandle: NodeJS.Timeout | undefined;
+
+		const snapshot = () => ({
+			stdout: stdoutAcc.toString(),
+			stderr: stderrAcc.toString(),
+		});
 
 		const onAbort = () => {
 			// Mirrors ShellCommand.ts:155-160 (#abortHandler):
@@ -724,10 +997,10 @@ async function executeForeground(
 		};
 
 		const foregroundStdoutHandler = (chunk: Buffer) => {
-			stdout += chunk.toString("utf-8");
+			stdoutAcc.append(chunk);
 		};
 		const foregroundStderrHandler = (chunk: Buffer) => {
-			stderr += chunk.toString("utf-8");
+			stderrAcc.append(chunk);
 		};
 		const foregroundExitHandler = (code: number) => {
 			if (settled) return;
@@ -736,9 +1009,9 @@ async function executeForeground(
 			if (signal?.aborted && !aborted && !interrupted) {
 				aborted = true;
 			}
+			const snap = snapshot();
 			resolve({
-				stdout,
-				stderr,
+				...snap,
 				exitCode: code,
 				timedOut,
 				aborted,
@@ -753,9 +1026,9 @@ async function executeForeground(
 			if (settled) return;
 			settled = true;
 			cleanup();
+			const snap = snapshot();
 			resolve({
-				stdout,
-				stderr,
+				...snap,
 				exitCode: null,
 				timedOut,
 				aborted,
@@ -785,10 +1058,10 @@ async function executeForeground(
 					if (timeoutHandle) clearTimeout(timeoutHandle);
 					child.stdout?.removeListener("data", foregroundStdoutHandler);
 					child.stderr?.removeListener("data", foregroundStderrHandler);
-					onTimeout(child, stdout, stderr);
+					const snap = snapshot();
+					onTimeout(child, snap.stdout, snap.stderr);
 					resolve({
-						stdout,
-						stderr,
+						...snap,
 						exitCode: null,
 						timedOut: true,
 						aborted: false,
@@ -1382,7 +1655,7 @@ Important:
 			return t;
 		},
 
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(toolCallId, params, signal, _onUpdate, ctx) {
 			const { command, timeout, description } = params;
 			const runInBackground = isBackgroundDisabled
 				? false
@@ -1487,12 +1760,24 @@ Important:
 				baseDetails.aborted = true;
 			}
 
+			// Large output: persist the full result to the session tool-results dir
+			// and replace the model-facing content with a `<persisted-output>`
+			// envelope (Claude Code parity — toolResultStorage.ts
+			// `maybePersistLargeToolResult` / `buildLargeToolResultMessage`).
+			const fullText = outputText || "(no output)";
+			const persisted = persistLargeOutputIfExceeds(fullText, toolCallId, ctx);
+			const finalText = persisted ? persisted.contentText : fullText;
+			if (persisted) {
+				baseDetails.persistedOutputPath = persisted.persistedOutputPath;
+				baseDetails.persistedOutputSize = persisted.persistedOutputSize;
+			}
+
 			const hasError =
 				result.timedOut ||
 				result.aborted ||
 				(result.exitCode !== null && result.exitCode !== 0);
 			return {
-				content: [tc(outputText || "(no output)")],
+				content: [tc(finalText)],
 				details: baseDetails,
 				isError: !!hasError,
 			};

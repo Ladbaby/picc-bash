@@ -415,3 +415,100 @@ test("resolveBashPath returns a usable bash.exe on Windows", () => {
 	assert.match(p, /bash\.exe$/i, `path should end in bash.exe, got: ${p}`);
 	assert.ok(existsSync(p), `bash.exe should exist at ${p}`);
 });
+
+// ---------------------------------------------------------------------------
+// Large tool-result persistence (Claude Code parity).
+//
+// The bash tool persists oversized foreground output to a per-session
+// tool-results file and returns a `<persisted-output>` envelope instead of the
+// full text. The threshold is `BASH_MAX_OUTPUT_LENGTH` (default 30_000) clamped
+// to 50_000.
+// ---------------------------------------------------------------------------
+
+function expectedToolResultsDir(): string {
+	return join(tmpdir(), "picc-bash", "test-session", "tool-results");
+}
+
+// A cross-platform command that emits a known amount of output. ~7000 chars —
+// below the default 30_000-char persistence threshold.
+const MEDIUM_OUTPUT_COMMAND =
+	"node -e \"for(let i=0;i<1000;i++)console.log('line-'+i)\"";
+// ~96KB — comfortably above the default threshold.
+const LARGE_OUTPUT_COMMAND =
+	"node -e \"for(let i=0;i<10000;i++)console.log('line-'+i)\"";
+
+test("large output: result under threshold is returned inline (no persistence)", async () => {
+	// Use the default threshold (30_000) and a small output — no persistence.
+	const prev = process.env.BASH_MAX_OUTPUT_LENGTH;
+	delete process.env.BASH_MAX_OUTPUT_LENGTH;
+	try {
+		const r = await bash.execute!(
+			"call-large-1",
+			{ command: MEDIUM_OUTPUT_COMMAND },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(r.isError, false);
+		const text = r.content[0].text;
+		assert.doesNotMatch(text, /^<persisted-output>/, "should be inline, not an envelope");
+		assert.ok(text.includes("line-0"), "should contain raw output");
+		assert.ok(text.includes("line-999"), "should contain the last output line");
+		assert.equal(
+			(r.details as { persistedOutputPath?: string })?.persistedOutputPath,
+			undefined,
+			"should not persist when under threshold",
+		);
+	} finally {
+		if (prev === undefined) delete process.env.BASH_MAX_OUTPUT_LENGTH;
+		else process.env.BASH_MAX_OUTPUT_LENGTH = prev;
+	}
+});
+
+test("large output: result over threshold is persisted to a tool-results file", async () => {
+	const prev = process.env.BASH_MAX_OUTPUT_LENGTH;
+	process.env.BASH_MAX_OUTPUT_LENGTH = "5000"; // lower the threshold
+	try {
+		const r = await bash.execute!(
+			"call-large-2",
+			{ command: LARGE_OUTPUT_COMMAND },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(r.isError, false);
+		const text = r.content[0].text;
+		assert.match(text, /^<persisted-output>\n/, "content should be a <persisted-output> envelope");
+		assert.match(text, /Full output saved to: /, "envelope should point at a saved file");
+		assert.match(text, /Preview \(first 2KB\):/, "envelope should note the preview size");
+		assert.match(text, /\n\.\.\.\n<\/persisted-output>\s*$/, "envelope should end with ellipsis + closing tag");
+
+		const details = r.details as {
+			persistedOutputPath?: string;
+			persistedOutputSize?: number;
+		};
+		assert.ok(details.persistedOutputPath, "details should carry the persisted path");
+		assert.ok(
+			details.persistedOutputPath!.startsWith(expectedToolResultsDir()),
+			`persisted file should live under ${expectedToolResultsDir()}, got ${details.persistedOutputPath}`,
+		);
+		assert.match(
+			details.persistedOutputPath!,
+			/[/\\]call-large-2\.txt$/,
+			"persisted file should be named call-large-2.txt",
+		);
+		assert.ok(
+			existsSync(details.persistedOutputPath!),
+			`persisted file should exist at ${details.persistedOutputPath}`,
+		);
+		const raw = readFileSync(details.persistedOutputPath!, "utf-8");
+		assert.ok(
+			raw.includes("line-9999"),
+			"persisted file should contain the FULL output (last line)",
+		);
+		assert.equal(details.persistedOutputSize, raw.length, "persisted size should match file");
+	} finally {
+		if (prev === undefined) delete process.env.BASH_MAX_OUTPUT_LENGTH;
+		else process.env.BASH_MAX_OUTPUT_LENGTH = prev;
+	}
+});
