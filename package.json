@@ -1,7 +1,7 @@
 {
   "name": "@ladbabynpm/picc-bash",
-  "version": "0.2.2",
-  "description": "Claude Code-compatible Bash tool for pi: run_in_background, configurable tool name, TaskStop.",
+  "version": "0.2.3",
+  "description": "Claude Code style Bash and TaskStop tool for pi, supporting run_in_background and send to background upon timeout.",
   "type": "module",
   "main": "index.ts",
   "keywords": [
