@@ -1684,13 +1684,10 @@ Important:
 			try {
 				effectiveTimeout = resolveTimeoutMs(timeout);
 			} catch (err) {
-				const message = err instanceof Error ? err.message : String(err);
-				const result: BashToolResult = {
-					content: [tc(message)],
-					details: {},
-					isError: true,
-				};
-				return result;
+				// Surface an invalid timeout as an error result. pi's runtime
+				// only marks a result as an error when execute() throws, so
+				// re-throw with the validation message.
+				throw err instanceof Error ? err : new Error(String(err));
 			}
 
 			// Auto-background on timeout (mirrors claude-code
@@ -1776,10 +1773,22 @@ Important:
 				result.timedOut ||
 				result.aborted ||
 				(result.exitCode !== null && result.exitCode !== 0);
+			// pi's agent runtime flags a tool result as an error ONLY when
+			// execute() throws (see executePreparedToolCall in pi-agent-core: a
+			// resolved promise always yields isError:false and any `isError`
+			// property on the returned object is ignored). pi's own built-in
+			// bash tool therefore throws an Error whose message is the full
+			// output plus a status line on abort / timeout / non-zero exit.
+			// Mirror that: `finalText` already contains the exit-code / timeout /
+			// abort text (and the `<persisted-output>` envelope when oversized),
+			// so it becomes the error message. The model still receives the full
+			// output, but the result is now correctly rendered as a failure.
+			if (hasError) {
+				throw new Error(finalText);
+			}
 			return {
 				content: [tc(finalText)],
 				details: baseDetails,
-				isError: !!hasError,
 			};
 		},
 	});
@@ -1824,11 +1833,10 @@ Important:
 				task_id: "",
 				task_type: "local_bash",
 			};
-			return {
-				content: [tc(JSON.stringify(payload))],
-				details: payload,
-				isError: true,
-			};
+			// pi's runtime marks a tool result as an error only when execute()
+			// throws; a resolved object's `isError` is ignored. Throw so the failure is
+			// rendered/reported as an error (message carries the JSON payload).
+			throw new Error(JSON.stringify(payload));
 		}
 
 		const task = getTask(id);
@@ -1838,11 +1846,10 @@ Important:
 				task_id: id,
 				task_type: "local_bash",
 			};
-			return {
-				content: [tc(JSON.stringify(payload))],
-				details: payload,
-				isError: true,
-			};
+			// pi's runtime marks a tool result as an error only when execute()
+			// throws; a resolved object's `isError` is ignored. Throw so the failure is
+			// rendered/reported as an error (message carries the JSON payload).
+			throw new Error(JSON.stringify(payload));
 		}
 
 		if (task.status !== "running") {
@@ -1853,11 +1860,10 @@ Important:
 				command: task.command,
 				alreadyExited: true,
 			};
-			return {
-				content: [tc(JSON.stringify(payload))],
-				details: payload,
-				isError: true,
-			};
+			// pi's runtime marks a tool result as an error only when execute()
+			// throws; a resolved object's `isError` is ignored. Throw so the failure is
+			// rendered/reported as an error (message carries the JSON payload).
+			throw new Error(JSON.stringify(payload));
 		}
 
 		if (task.pid !== undefined) {

@@ -91,22 +91,20 @@ test("foreground: echo hello", async () => {
 		undefined,
 		ctx,
 	);
-	assert.equal(r.isError, false, "should not be an error");
+	assert.equal(r.isError, undefined, "should not be an error");
 	const text = r.content[0].text;
 	assert.ok(text.includes("hello"), `output should include 'hello', got: ${text}`);
 });
 
-test("foreground: exit 1 returns isError=true", async () => {
-	const r = await bash.execute!(
-		"call-2",
-		{ command: "exit 1" },
-		undefined,
-		undefined,
-		ctx,
+test("foreground: exit 1 throws an error result", async () => {
+	// A non-zero exit code is surfaced by THROWING (pi only flags an error when
+	// execute() rejects; a resolved object's isError is ignored). The error
+	// message carries the formatted output: `Exit code 1` (no colon).
+	await assert.rejects(
+		(async () =>
+			await bash.execute!("call-2", { command: "exit 1" }, undefined, undefined, ctx)),
+		/Exit code 1/,
 	);
-	assert.equal(r.isError, true);
-	// Claude Code format (BashTool.tsx formatBashOutput): `Exit code 1` (no colon).
-	assert.match(r.content[0].text, /Exit code 1/);
 });
 
 test("foreground: sleep is not auto-backgrounded (killed on timeout)", async () => {
@@ -114,17 +112,13 @@ test("foreground: sleep is not auto-backgrounded (killed on timeout)", async () 
 	// a timed-out `sleep` is still killed rather than backgrounded.
 	// Windows is skipped: cmd.exe has no `sleep` (the test would exit early).
 	if (process.platform === "win32") return;
-	const r = await bash.execute!(
-		"call-3",
-		{ command: "sleep 5", timeout: 500 },
-		undefined,
-		undefined,
-		ctx,
+	// A timed-out command that is not auto-backgrounded throws an error whose
+	// message carries the timeout status.
+	await assert.rejects(
+		(async () =>
+			await bash.execute!("call-3", { command: "sleep 5", timeout: 500 }, undefined, undefined, ctx)),
+		/Command timed out/,
 	);
-	assert.equal(r.isError, true, "should be an error after timeout");
-	const details = r.details as { timedOut?: boolean; backgroundTaskId?: string };
-	assert.equal(details?.timedOut, true, "details.timedOut should be true");
-	assert.equal(details?.backgroundTaskId, undefined, "sleep must not be backgrounded");
 });
 
 test("foreground: command that hits its timeout is auto-backgrounded", async () => {
@@ -221,19 +215,18 @@ test("background: log file exists and contains output", async () => {
 	assert.ok(raw.includes("bg-test-marker"), "raw output file contains the marker");
 });
 
-test("TaskStop on unknown id returns isError with the standard message", async () => {
-	const r = await taskStop.execute!(
+test("TaskStop on unknown id throws with the standard message", async () => {
+	// Errors are surfaced by throwing; the error message is the JSON payload
+	// (mirrors Claude Code's TaskStopTool.ts:88-91 payload shape).
+	const err = await taskStop.execute!(
 		"call-7",
 		{ task_id: "no-such-task" },
 		undefined,
 		undefined,
 		ctx,
-	);
-	assert.equal(r.isError, true);
-	// Claude Code's TaskStopTool.ts:88-91 returns the same payload object for
-	// both the model's `content` (as JSON-stringified text) and the tool's
-	// structured `details`. We mirror that exactly.
-	const parsed = JSON.parse(r.content[0].text) as {
+	).catch((e: unknown) => e);
+	assert.ok(err instanceof Error, "should throw an Error");
+	const parsed = JSON.parse((err as Error).message) as {
 		message: string;
 		task_id: string;
 		task_type: string;
@@ -241,15 +234,6 @@ test("TaskStop on unknown id returns isError with the standard message", async (
 	assert.equal(parsed.message, "No task found with ID: no-such-task");
 	assert.equal(parsed.task_id, "no-such-task");
 	assert.equal(parsed.task_type, "local_bash");
-
-	const details = r.details as {
-		message: string;
-		task_id: string;
-		task_type: string;
-	};
-	assert.equal(details.message, "No task found with ID: no-such-task");
-	assert.equal(details.task_id, "no-such-task");
-	assert.equal(details.task_type, "local_bash");
 });
 
 test("TaskStop on a running task kills it and returns Claude Code's success message", async () => {
@@ -315,23 +299,21 @@ test("TaskStop on already-stopped task returns isError with alreadyExited flag",
 	const taskId = (bg.details as { backgroundTaskId: string }).backgroundTaskId;
 	await taskStop.execute!("call-11", { task_id: taskId }, undefined, undefined, ctx);
 
-	// Second TaskStop on the same id — task is no longer running.
-	const r = await taskStop.execute!(
+	// Second TaskStop on the same id — task is no longer running, so it throws.
+	const err = await taskStop.execute!(
 		"call-12",
 		{ task_id: taskId },
 		undefined,
 		undefined,
 		ctx,
-	);
-	assert.equal(r.isError, true);
-	const parsed = JSON.parse(r.content[0].text) as {
+	).catch((e: unknown) => e);
+	assert.ok(err instanceof Error, "should throw an Error");
+	const parsed = JSON.parse((err as Error).message) as {
 		message: string;
 		alreadyExited?: boolean;
 	};
 	assert.match(parsed.message, new RegExp(`Task ${taskId} is not running`));
-
-	const details = r.details as { alreadyExited?: boolean; command: string };
-	assert.equal(details.alreadyExited, true);
+	assert.equal(parsed.alreadyExited, true);
 });
 
 test("TaskStop accepts shell_id (compat shim for the removed KillShell alias)", async () => {
@@ -397,7 +379,7 @@ test("foreground: backslash Windows path resolves correctly (MSYS regression)", 
 		undefined,
 		ctx,
 	);
-	assert.equal(r.isError, false, `ls should not error, got: ${r.content[0].text}`);
+	assert.equal(r.isError, undefined, `ls should not error, got: ${r.content[0].text}`);
 	const text = r.content[0].text;
 	assert.ok(text.length > 0, "ls should produce some output");
 	assert.doesNotMatch(
@@ -449,7 +431,7 @@ test("large output: result under threshold is returned inline (no persistence)",
 			undefined,
 			ctx,
 		);
-		assert.equal(r.isError, false);
+		assert.equal(r.isError, undefined);
 		const text = r.content[0].text;
 		assert.doesNotMatch(text, /^<persisted-output>/, "should be inline, not an envelope");
 		assert.ok(text.includes("line-0"), "should contain raw output");
@@ -476,7 +458,7 @@ test("large output: result over threshold is persisted to a tool-results file", 
 			undefined,
 			ctx,
 		);
-		assert.equal(r.isError, false);
+		assert.equal(r.isError, undefined);
 		const text = r.content[0].text;
 		assert.match(text, /^<persisted-output>\n/, "content should be a <persisted-output> envelope");
 		assert.match(text, /Full output saved to: /, "envelope should point at a saved file");
