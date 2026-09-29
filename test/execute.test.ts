@@ -71,10 +71,16 @@ if (!bash?.execute || !taskStop?.execute) {
 	throw new Error("Tools missing execute handlers");
 }
 
+const notifications: Array<{ message: string; level?: string }> = [];
+
 const ctx = {
 	cwd: process.cwd(),
 	sessionManager: { getSessionId: () => "test-session" },
-	ui: { notify: () => {} },
+	ui: {
+		notify: (message: string, level?: string) => {
+			notifications.push({ message, level });
+		},
+	},
 };
 
 const isWindows = process.platform === "win32";
@@ -236,7 +242,8 @@ test("TaskStop on unknown id throws with the standard message", async () => {
 	assert.equal(parsed.task_type, "local_bash");
 });
 
-test("TaskStop on a running task kills it and returns Claude Code's success message", async () => {
+test("TaskStop on a running task kills it and suppresses its exit warning", async () => {
+	notifications.length = 0;
 	const bg = await bash.execute!(
 		"call-8",
 		{
@@ -285,6 +292,15 @@ test("TaskStop on a running task kills it and returns Claude Code's success mess
 	assert.equal(details.task_id, taskId);
 	assert.equal(details.task_type, "local_bash");
 	assert.equal(details.command, cmd);
+
+	// The child exits asynchronously after TaskStop. Its callback must preserve
+	// the explicit killed state and not turn the intentional stop into a warning.
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(
+		notifications.length,
+		0,
+		"TaskStop must suppress the child exit completion warning",
+	);
 });
 
 test("TaskStop on already-stopped task returns isError with alreadyExited flag", async () => {

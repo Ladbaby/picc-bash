@@ -1313,9 +1313,13 @@ function backgroundExistingForegroundTask(
 	});
 
 	child.on("exit", (code) => {
+		const currentTask = getTask(id);
+		// TaskStop has already recorded the intentional stop. Do not let the
+		// child-process exit replace it with a failure or emit a noisy warning.
+		if (currentTask?.status === "killed") return;
 		const status: TaskStatus = code === 0 ? "completed" : "failed";
 		const updated: BackgroundTask = {
-			...task,
+			...(currentTask ?? task),
 			status,
 			exitCode: code,
 			completedAt: Date.now(),
@@ -1325,8 +1329,10 @@ function backgroundExistingForegroundTask(
 	});
 
 	child.on("error", () => {
+		const currentTask = getTask(id);
+		if (currentTask?.status === "killed") return;
 		const updated: BackgroundTask = {
-			...task,
+			...(currentTask ?? task),
 			status: "failed",
 			completedAt: Date.now(),
 			interrupted: true,
