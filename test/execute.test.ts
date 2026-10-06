@@ -5,11 +5,14 @@
  * Run: npx tsx test/execute.test.ts
  */
 
-import { test } from "node:test";
 import assert from "node:assert/strict";
+import childProcess, { type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
 import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { mock, test } from "node:test";
 import extension, {
 	_resetBashPathForTest,
 	config,
@@ -39,6 +42,17 @@ interface RegisteredTool {
 }
 
 const registered: RegisteredTool[] = [];
+const notifications: Array<{ message: string; level?: string }> = [];
+
+const ctx = {
+	cwd: process.cwd(),
+	sessionManager: { getSessionId: () => "test-session" },
+	ui: {
+		notify: (message: string, level?: string) => {
+			notifications.push({ message, level });
+		},
+	},
+};
 
 const pi = {
 	registerTool(def: RegisteredTool): void {
@@ -48,11 +62,7 @@ const pi = {
 		// Capture session_start so we initialize the path memoization the
 		// extension expects before any tool call.
 		if (event === "session_start") {
-			(handler as (e: unknown, ctx: unknown) => void)({ type: "session_start" }, {
-				cwd: process.cwd(),
-				sessionManager: { getSessionId: () => "test-session" },
-				ui: { notify: () => {} },
-			});
+			(handler as (e: unknown, ctx: unknown) => void)({ type: "session_start" }, ctx);
 		}
 	},
 };
@@ -70,18 +80,6 @@ const taskStop = registered.find((t) => t.name === "TaskStop");
 if (!bash?.execute || !taskStop?.execute) {
 	throw new Error("Tools missing execute handlers");
 }
-
-const notifications: Array<{ message: string; level?: string }> = [];
-
-const ctx = {
-	cwd: process.cwd(),
-	sessionManager: { getSessionId: () => "test-session" },
-	ui: {
-		notify: (message: string, level?: string) => {
-			notifications.push({ message, level });
-		},
-	},
-};
 
 const isWindows = process.platform === "win32";
 
@@ -242,20 +240,34 @@ test("TaskStop on unknown id throws with the standard message", async () => {
 	assert.equal(parsed.task_type, "local_bash");
 });
 
-test("TaskStop on a running task kills it and suppresses its exit warning", async () => {
-	notifications.length = 0;
-	const bg = await bash.execute!(
-		"call-8",
-		{
-			command: isWindows ? "ping -n 60 127.0.0.1" : "sleep 30",
-			run_in_background: true,
-		},
-		undefined,
-		undefined,
-		ctx,
-	);
+async function assertTaskStopSuppressesNotifications(autoBackground: boolean): Promise<void> {
+	const cmd = isWindows ? "ping -n 60 127.0.0.1" : "echo stop-test; sleep 30";
+	const description = `stop-test-${autoBackground ? "promoted" : "explicit"}`;
+	// Observe the real child's close event rather than guessing when tree-kill
+	// finishes (Windows taskkill can take much longer than 250ms).
+	const spawnMock = mock.method(childProcess, "spawn", childProcess.spawn);
+	syncBuiltinESMExports();
+	let bg: Awaited<ReturnType<NonNullable<RegisteredTool["execute"]>>>;
+	let child: ChildProcess;
+	try {
+		bg = await bash.execute!(
+			"call-8",
+			{
+				command: cmd,
+				description,
+				...(autoBackground ? { timeout: 500 } : { run_in_background: true }),
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+		child = spawnMock.mock.calls.at(-1)!.result as ChildProcess;
+	} finally {
+		spawnMock.mock.restore();
+		syncBuiltinESMExports();
+	}
+	const closed = once(child, "close", { signal: AbortSignal.timeout(15_000) });
 	const taskId = (bg.details as { backgroundTaskId: string }).backgroundTaskId;
-	const cmd = isWindows ? "ping -n 60 127.0.0.1" : "sleep 30";
 
 	const r = await taskStop.execute!(
 		"call-9",
@@ -295,13 +307,69 @@ test("TaskStop on a running task kills it and suppresses its exit warning", asyn
 
 	// The child exits asynchronously after TaskStop. Its callback must preserve
 	// the explicit killed state and not turn the intentional stop into a warning.
-	await new Promise((resolve) => setTimeout(resolve, 250));
-	assert.equal(
-		notifications.length,
-		0,
-		"TaskStop must suppress the child exit completion warning",
+	await closed;
+	// A late error must be ignored just like an exit caused by TaskStop.
+	child.emit("error", new Error("late error after intentional stop"));
+	assert.deepEqual(
+		notifications.filter(({ message }) => message.includes(`"${description}"`)),
+		[],
+		"TaskStop must suppress both exit and error completion notifications",
 	);
-});
+	await assert.rejects(
+		taskStop.execute!("call-9-again", { task_id: taskId }, undefined, undefined, ctx),
+		/\(status: killed\)/,
+		"exit/error handlers must preserve the killed task state",
+	);
+}
+
+for (const autoBackground of [false, true]) {
+	test(`TaskStop preserves killed state without notifications (${autoBackground ? "timeout-promoted" : "explicit background"})`, async () => {
+		await assertTaskStopSuppressesNotifications(autoBackground);
+	});
+}
+
+for (const exitCode of [0, 1]) {
+	test(`background: natural exit ${exitCode} still sends a notification`, async () => {
+		const description = `natural-exit-${exitCode}`;
+		let resolveNotification: (value: { message: string; level?: string }) => void;
+		const notified = new Promise<{ message: string; level?: string }>((resolve) => {
+			resolveNotification = resolve;
+		});
+		const notifyMock = mock.method(ctx.ui, "notify", (message: string, level?: string) => {
+			notifications.push({ message, level });
+			if (message.includes(`"${description}"`)) {
+				resolveNotification({ message, level });
+			}
+		});
+		try {
+			const bg = await bash.execute!(
+				`call-natural-${exitCode}`,
+				{ command: `exit ${exitCode}`, description, run_in_background: true },
+				undefined,
+				undefined,
+				ctx,
+			);
+			const notification = await new Promise<{ message: string; level?: string }>((resolve, reject) => {
+				const timeout = setTimeout(() => reject(new Error("No completion notification")), 15_000);
+				notified.then((value) => {
+					clearTimeout(timeout);
+					resolve(value);
+				});
+			});
+			const status = exitCode === 0 ? "completed" : "failed";
+			assert.deepEqual(notification, {
+				message: `Background task "${description}" ${status} (exit ${exitCode})`,
+				level: exitCode === 0 ? "info" : "warning",
+			});
+			await assert.rejects(
+				taskStop.execute!("call-natural-stop", { task_id: (bg.details as { backgroundTaskId: string }).backgroundTaskId }, undefined, undefined, ctx),
+				new RegExp(`\\(status: ${status}\\)`),
+			);
+		} finally {
+			notifyMock.mock.restore();
+		}
+	});
+}
 
 test("TaskStop on already-stopped task returns isError with alreadyExited flag", async () => {
 	// Start + immediately stop to leave a known-killed task.

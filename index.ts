@@ -1393,9 +1393,12 @@ async function startBackgroundTask(
 		// No `[Exit code: N]` trailer in the output file — Claude Code doesn't
 		// write exit codes to the task file. Exit code lives only on the
 		// structured `details.exitCode` returned to the model.
+		const currentTask = getTask(id);
+		// Preserve TaskStop's intentional stop, as in the timeout-promoted path.
+		if (currentTask?.status === "killed") return;
 		const status: TaskStatus = code === 0 ? "completed" : "failed";
 		const updated: BackgroundTask = {
-			...task,
+			...(currentTask ?? task),
 			status,
 			exitCode: code,
 			completedAt: Date.now(),
@@ -1405,8 +1408,10 @@ async function startBackgroundTask(
 	});
 
 	child.on("error", () => {
+		const currentTask = getTask(id);
+		if (currentTask?.status === "killed") return;
 		const updated: BackgroundTask = {
-			...task,
+			...(currentTask ?? task),
 			status: "failed",
 			completedAt: Date.now(),
 			interrupted: true,
